@@ -134,7 +134,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [permissions, "probe@private-pr"]
+        # permissions: a read-only token, so the comment is refused (comment_permission); GitHub may still accept the
+        # SARIF of a pull request in a public repository. sarif-refused: an invalid token, so the upload is refused for
+        # certain (sarif_upload_failed) and the result stays the scan's.
+        case: [permissions, "probe@private-pr", sarif-refused]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -157,6 +160,7 @@ jobs:
           comment: ${{ steps.case.outputs.comment }}
           sarif-upload: ${{ steps.case.outputs.sarif-upload }}
           telemetry: ${{ steps.case.outputs.telemetry }}
+          token: ${{ steps.case.outputs.token || github.token }}
       - name: Check the result
         if: always()
         env:
