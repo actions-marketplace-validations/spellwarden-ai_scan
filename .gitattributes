@@ -1,0 +1,2 @@
+# Fixture files keep their bytes on every runner: no line-end conversion (spec 7.4, one result on three OSs).
+fixtures/** -text

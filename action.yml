@@ -1,0 +1,319 @@
+name: Spellwarden Scan
+description: Scan agent skills, MCP server configurations and Claude Code hooks in pull requests.
+author: Spellwarden
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  path:
+    description: The directory to scan. Findings, the lock and the baseline use paths relative to it.
+    required: false
+    default: "."
+  fail-on:
+    description: "The lowest severity that fails the check: critical, high, medium, low or never."
+    required: false
+    default: high
+  locked:
+    description: "auto checks the lock when .spellwarden/lock.json exists; true requires it; false skips it."
+    required: false
+    default: auto
+  probe:
+    description: "true probes each remote MCP server of the configuration from the runner, without credentials."
+    required: false
+    default: "false"
+  probe-private:
+    description: "true lets the probe reach the configured servers' own private addresses, never a link-local one. Honoured only on a push, schedule or manual run of a protected branch or tag."
+    required: false
+    default: "false"
+  comment:
+    description: "true keeps one comment with the report on the pull request (needs pull-requests: write)."
+    required: false
+    default: "true"
+  sarif-upload:
+    description: "true uploads the SARIF file to code scanning (needs security-events: write)."
+    required: false
+    default: "true"
+  telemetry:
+    description: "false switches off the pseudonymous usage ping described in the README."
+    required: false
+    default: "true"
+  token:
+    description: The token used for the pull request comment and the SARIF upload.
+    required: false
+    default: ${{ github.token }}
+  requirements-file:
+    description: "Test hook only: an alternative hash-pinned requirements file. Leave it empty."
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: "0 passed, 1 failed on findings, 2 incomplete or invalid, 3 lock file absent or stale."
+    value: ${{ steps.result.outputs.exit-code }}
+  findings:
+    description: The number of findings not accepted in the baseline.
+    value: ${{ steps.result.outputs.findings }}
+  sarif-file:
+    description: The path of the SARIF file, empty when none was written.
+    value: ${{ steps.result.outputs.sarif-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        SW_FAIL_ON: ${{ inputs.fail-on }}
+        SW_LOCKED: ${{ inputs.locked }}
+        SW_PROBE: ${{ inputs.probe }}
+        SW_PROBE_PRIVATE: ${{ inputs.probe-private }}
+        SW_COMMENT: ${{ inputs.comment }}
+        SW_SARIF_UPLOAD: ${{ inputs.sarif-upload }}
+        SW_TELEMETRY: ${{ inputs.telemetry }}
+      run: |
+        {
+          echo "SW_EXIT=2"
+          echo "SW_FINDINGS=0"
+          echo "SW_SARIF="
+          echo "SW_VALID="
+          echo "SW_BASE_PY="
+          echo "SW_READY="
+          echo "SW_PY="
+          echo "SW_UPLOAD="
+        } >> "$GITHUB_ENV"
+        bad=""
+        case "$SW_FAIL_ON" in
+          critical|high|medium|low|never) ;;
+          *) bad="fail-on (expected critical, high, medium, low or never)" ;;
+        esac
+        if [ -z "$bad" ]; then
+          case "$SW_LOCKED" in
+            auto|true|false) ;;
+            *) bad="locked (expected auto, true or false)" ;;
+          esac
+        fi
+        for pair in "probe=$SW_PROBE" "probe-private=$SW_PROBE_PRIVATE" "comment=$SW_COMMENT" \
+                    "sarif-upload=$SW_SARIF_UPLOAD" "telemetry=$SW_TELEMETRY"; do
+          if [ -n "$bad" ]; then break; fi
+          case "${pair#*=}" in
+            true|false) ;;
+            *) bad="${pair%%=*} (expected true or false)" ;;
+          esac
+        done
+        if [ -n "$bad" ]; then
+          echo "::error title=Spellwarden::The input $bad has a value the Action does not accept."
+          exit 0
+        fi
+        echo "SW_VALID=true" >> "$GITHUB_ENV"
+
+    - name: Find Python 3.11 or newer
+      if: env.SW_VALID == 'true'
+      shell: bash
+      run: |
+        check='import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'
+        where='import sys; print(sys.executable)'
+        found=""
+        for candidate in python3 python; do
+          if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -I -c "$check" >/dev/null 2>&1; then
+            found="$("$candidate" -I -c "$where")"
+            break
+          fi
+        done
+        if [ -z "$found" ] && [ "$RUNNER_OS" = "Windows" ] && command -v py >/dev/null 2>&1 \
+           && py -3 -I -c "$check" >/dev/null 2>&1; then
+          found="$(py -3 -I -c "$where")"
+        fi
+        if [ -z "$found" ]; then
+          echo "::error title=Spellwarden::Spellwarden needs Python 3.11 or newer on the runner; add actions/setup-python before this step."
+          exit 0
+        fi
+        if command -v cygpath >/dev/null 2>&1; then found="$(cygpath -u "$found")"; fi
+        echo "SW_BASE_PY=$found" >> "$GITHUB_ENV"
+
+    - name: Install the scanner (hash-checked)
+      if: env.SW_BASE_PY != ''
+      shell: bash
+      env:
+        SW_REQUIREMENTS_FILE: ${{ inputs.requirements-file }}
+      run: |
+        # Every Python here runs in isolated mode (-I): the working directory is the scanned checkout, and a
+        # json.py, pip/ or spellwarden_cli/ there would otherwise be imported first.
+        venv="$RUNNER_TEMP/spellwarden-venv"
+        log="$RUNNER_TEMP/spellwarden-install.log"
+        show_log() {  # the log's last lines, which may quote a requirements file, never read as workflow commands
+          local token
+          token="$("$SW_BASE_PY" -I -c 'import secrets; print(secrets.token_hex(16))' | tr -d '\r')" || token=""
+          case "$token" in ''|*[!0-9a-f]*) echo "(the output is not shown: no log token could be made)"; return ;; esac
+          echo "::stop-commands::$token"
+          tail -n 20 "$log"
+          echo "::$token::"
+        }
+        rm -rf "$venv"
+        if ! "$SW_BASE_PY" -I -m venv "$venv" >"$log" 2>&1; then
+          echo "::error title=Spellwarden::Creating a virtual environment for the scanner failed; the last lines of its output follow."
+          show_log
+          exit 0
+        fi
+        if [ -f "$venv/bin/python" ]; then venv_py="$venv/bin/python"; else venv_py="$venv/Scripts/python.exe"; fi
+        if command -v cygpath >/dev/null 2>&1; then venv_py="$(cygpath -u "$venv_py")"; fi
+        requirements="$SW_REQUIREMENTS_FILE"
+        if [ -z "$requirements" ]; then requirements="$GITHUB_ACTION_PATH/requirements.txt"; fi
+        if ! "$venv_py" -I -m pip install --disable-pip-version-check --no-input --require-hashes --no-deps \
+             --only-binary :all: -r "$requirements" >"$log" 2>&1; then
+          echo "::error title=Spellwarden::Installing the scanner failed (every file is checked against its pinned hash); the last lines of pip's output follow."
+          show_log
+          exit 0
+        fi
+        {
+          echo "SW_PY=$venv_py"
+          echo "SW_READY=true"
+        } >> "$GITHUB_ENV"
+
+    - name: Scan
+      if: env.SW_READY == 'true'
+      shell: bash
+      env:
+        SW_PATH: ${{ inputs.path }}
+        SW_FAIL_ON: ${{ inputs.fail-on }}
+        SW_LOCKED: ${{ inputs.locked }}
+        SW_PROBE: ${{ inputs.probe }}
+        SW_PROBE_PRIVATE: ${{ inputs.probe-private }}
+        SW_TELEMETRY: ${{ inputs.telemetry }}
+      run: |
+        out="$RUNNER_TEMP/spellwarden"
+        rm -f "$out.sarif" "$out.md" "$out.json"
+        args=(scan "$SW_PATH" --fail-on "$SW_FAIL_ON")
+        if [ "$SW_LOCKED" = "true" ] || { [ "$SW_LOCKED" = "auto" ] && [ -f "$SW_PATH/.spellwarden/lock.json" ]; }; then
+          args+=(--locked)
+        fi
+        if [ "$SW_PROBE" = "true" ]; then args+=(--probe); else args+=(--no-probe); fi
+        if [ "$SW_PROBE_PRIVATE" = "true" ]; then args+=(--probe-private); else args+=(--no-probe-private); fi
+        if [ "$SW_TELEMETRY" = "false" ]; then args+=(--no-telemetry); fi
+        args+=(--format sarif --output "$out.sarif" --format markdown --output "$out.md"
+               --format json --output "$out.json")
+        # The text report names directories of the scanned revision, and a log line that starts with :: is a
+        # workflow command (::error::, ::add-mask::, ::stop-commands::). It is printed only between a stop-commands
+        # line and its random resume token, which the scanned revision cannot know (spec 6.13); with no token it is
+        # not printed (the Markdown report in the job summary has the findings).
+        token="$("$SW_PY" -I -c 'import secrets; print(secrets.token_hex(16))' | tr -d '\r')" || token=""
+        case "$token" in ''|*[!0-9a-f]*) token="" ;; esac
+        if [ -n "$token" ]; then
+          args+=(--format text)
+          echo "::stop-commands::$token"
+        else
+          echo "::warning title=Spellwarden::The text report is not printed because no log token could be made; the job summary has the report."
+        fi
+        set +e
+        "$SW_PY" -I -m spellwarden_cli "${args[@]}"
+        code=$?
+        set -e
+        if [ -n "$token" ]; then echo "::$token::"; fi
+        "$SW_PY" -I - "$out.json" "$code" "$out.sarif" <<'PY'
+        import json
+        import os
+        import sys
+
+        report_path, code, sarif = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+        try:
+            with open(report_path, encoding="utf-8") as handle:
+                report = json.load(handle)
+            findings = sum(1 for finding in report["findings"] if not finding["suppressed"])
+        except (OSError, ValueError, KeyError, TypeError):
+            state = {"SW_EXIT": 2, "SW_FINDINGS": 0, "SW_SARIF": ""}
+        else:
+            state = {"SW_EXIT": code, "SW_FINDINGS": findings, "SW_SARIF": sarif if os.path.isfile(sarif) else ""}
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+            for key, value in state.items():
+                handle.write(f"{key}={value}\n")
+        PY
+
+    - name: Job summary
+      if: env.SW_READY == 'true'
+      shell: bash
+      run: |
+        if [ -f "$RUNNER_TEMP/spellwarden.md" ]; then cat "$RUNNER_TEMP/spellwarden.md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+    - name: Decide whether the SARIF upload can work
+      if: env.SW_READY == 'true' && env.SW_SARIF != '' && inputs.sarif-upload == 'true'
+      shell: bash
+      run: |
+        "$SW_PY" -I - <<'PY'
+        import json
+        import os
+
+        restricted = os.environ.get("GITHUB_ACTOR", "") == "dependabot[bot]"
+        if os.environ.get("GITHUB_EVENT_NAME", "") in ("pull_request", "pull_request_target"):
+            try:
+                with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as handle:
+                    head = json.load(handle)["pull_request"]["head"]["repo"]["full_name"]
+                restricted = restricted or head != os.environ.get("GITHUB_REPOSITORY")
+            except (OSError, KeyError, TypeError, ValueError):
+                restricted = True
+        if restricted:
+            print("::notice title=Spellwarden::sarif_permission: code scanning alerts are not uploaded from fork and "
+                  "Dependabot pull requests, whose token cannot write them. The report is in the job summary.")
+            with open(os.path.join(os.environ["RUNNER_TEMP"], "spellwarden-annotations.txt"), "a", encoding="utf-8") as log:
+                log.write("sarif_permission\n")  # for the Action's own tests (spec 7.4)
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+            handle.write("SW_UPLOAD=" + ("false" if restricted else "true") + "\n")
+        PY
+
+    - name: Upload SARIF to code scanning
+      id: upload
+      if: env.SW_UPLOAD == 'true'
+      continue-on-error: true
+      uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee  # v4.39.0
+      with:
+        sarif_file: ${{ env.SW_SARIF }}
+        category: spellwarden
+        token: ${{ inputs.token }}
+
+    - name: Report a failed SARIF upload
+      if: steps.upload.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "sarif_upload_failed" >> "$RUNNER_TEMP/spellwarden-annotations.txt"  # for the Action's own tests (spec 7.4)
+        echo "::warning title=Spellwarden::sarif_upload_failed: the SARIF file was not uploaded to code scanning. Usual causes: the workflow does not grant security-events: write, the repository is private without GitHub Code Security, or the upload service failed. See the log of the upload step. The check result is the scan's."
+
+    - name: Pull request comment
+      if: env.SW_READY == 'true' && inputs.comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        if [ -f "$RUNNER_TEMP/spellwarden.md" ]; then
+          log="$RUNNER_TEMP/spellwarden-comment.log"
+          "$SW_PY" -I -m spellwarden_cli ci comment --provider github --body "$RUNNER_TEMP/spellwarden.md" >"$log" 2>&1 || true
+          # The scanner's own notices are annotations; any other line (a traceback, say) is printed where it cannot
+          # be read as a workflow command.
+          notice='^::notice title=Spellwarden::[a-z_]+: '
+          grep -E "$notice" "$log" >&2 || true
+          if grep -qvE "$notice" "$log"; then
+            token="$("$SW_PY" -I -c 'import secrets; print(secrets.token_hex(16))' | tr -d '\r')" || token=""
+            case "$token" in
+              ''|*[!0-9a-f]*) echo "(further output of the comment is not shown: no log token could be made)" >&2 ;;
+              *) echo "::stop-commands::$token"; grep -vE "$notice" "$log" >&2; echo "::$token::" ;;
+            esac
+          fi
+          # The notice codes, one per line, for the Action's own tests (spec 7.4).
+          sed -n -E 's/^::notice title=Spellwarden::([a-z_]+): .*/\1/p' "$log" >> "$RUNNER_TEMP/spellwarden-annotations.txt"
+        fi
+
+    - name: Result
+      id: result
+      if: always()
+      shell: bash
+      run: |
+        exit_code="${SW_EXIT:-2}"
+        findings="${SW_FINDINGS:-0}"
+        case "$exit_code" in ''|*[!0-9]*) exit_code=2 ;; esac
+        case "$findings" in ''|*[!0-9]*) findings=0 ;; esac
+        sarif=""
+        if [ -n "${SW_SARIF:-}" ] && [ -f "$SW_SARIF" ]; then sarif="$SW_SARIF"; fi
+        {
+          echo "exit-code=$exit_code"
+          echo "findings=$findings"
+          echo "sarif-file=$sarif"
+        } >> "$GITHUB_OUTPUT"
+        exit "$exit_code"
