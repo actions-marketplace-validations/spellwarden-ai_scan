@@ -1,0 +1,245 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Install actionlint (pinned version, checksum verified)
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+          ACTIONLINT_SHA256: "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$archive"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+      - name: actionlint over the workflow (and the inputs it passes to the local action)
+        run: '"$RUNNER_TEMP/actionlint" -color'
+      - name: The shell contract of action.yml and the workflow
+        run: python3 .github/scripts/lint_action.py action.yml .github/workflows/test.yml
+      - name: The base-settings guard
+        run: python3 .github/scripts/test_base_has_case.py
+
+  fixtures:
+    name: ${{ matrix.case }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        case: [clean, findings, baselined, stale-lock, broken-config, path-with-spaces, hostile-names, bad-input,
+               bad-requirements, exec-bit, subdir, probe, "probe@config-key"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the fixture repository
+        id: case
+        shell: bash
+        env:
+          CASE: ${{ matrix.case }}
+        run: python fixtures/make_repo.py "$CASE" "$RUNNER_TEMP/fx" --github-output
+      - name: Run the Action
+        id: scan
+        continue-on-error: true
+        uses: ./
+        with:
+          path: ${{ steps.case.outputs.path }}
+          fail-on: ${{ steps.case.outputs.fail-on }}
+          locked: ${{ steps.case.outputs.locked }}
+          probe: ${{ steps.case.outputs.probe }}
+          probe-private: ${{ steps.case.outputs.probe-private }}
+          comment: ${{ steps.case.outputs.comment }}
+          sarif-upload: ${{ steps.case.outputs.sarif-upload }}
+          telemetry: ${{ steps.case.outputs.telemetry }}
+          requirements-file: ${{ steps.case.outputs.requirements-file }}
+      - name: Check the result
+        if: always()
+        shell: bash
+        env:
+          CASE: ${{ matrix.case }}
+          SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
+          SW_OUT_FINDINGS: ${{ steps.scan.outputs.findings }}
+          SW_OUT_SARIF: ${{ steps.scan.outputs.sarif-file }}
+          SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
+          SW_FIXTURE_REPO: ${{ runner.temp }}/fx
+          # Spec 6.8: on a pull request from a fork the scanner turns --probe off; check.py applies on_fork_request.
+          SW_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: python fixtures/check.py "$CASE" "$RUNNER_TEMP/spellwarden.json" "$SW_OUT_EXIT" env
+
+  no-python:
+    name: no-python on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Build the fixture repository
+        id: case
+        run: python3 fixtures/make_repo.py no-python "$RUNNER_TEMP/fx" --github-output
+      - name: Build a PATH without Python
+        id: nopy
+        run: |
+          nopy="$RUNNER_TEMP/nopy"
+          mkdir -p "$nopy"
+          IFS=: read -r -a dirs <<< "$PATH"
+          for dir in "${dirs[@]}"; do
+            if [ ! -d "$dir" ]; then continue; fi
+            for tool in "$dir"/*; do
+              name="${tool##*/}"
+              case "$name" in python*|py|pip*|pydoc*|idle*) continue ;; esac
+              if [ -x "$tool" ] && [ ! -e "$nopy/$name" ]; then ln -s "$tool" "$nopy/$name"; fi
+            done
+          done
+          echo "dir=$nopy" >> "$GITHUB_OUTPUT"
+      - name: Run the Action without Python
+        id: scan
+        continue-on-error: true
+        uses: ./
+        env:
+          PATH: ${{ steps.nopy.outputs.dir }}
+        with:
+          path: ${{ steps.case.outputs.path }}
+          comment: "false"
+          sarif-upload: "false"
+          telemetry: "false"
+      - name: Check the result
+        if: always()
+        env:
+          SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
+          SW_OUT_FINDINGS: ${{ steps.scan.outputs.findings }}
+          SW_OUT_SARIF: ${{ steps.scan.outputs.sarif-file }}
+          SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
+        run: python3 fixtures/check.py no-python "$RUNNER_TEMP/spellwarden.json" "$SW_OUT_EXIT" env
+
+  pull-request-cases:
+    name: ${{ matrix.case }} (pull request, contents read only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [permissions, "probe@private-pr"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the fixture repository
+        id: case
+        env:
+          CASE: ${{ matrix.case }}
+        run: python fixtures/make_repo.py "$CASE" "$RUNNER_TEMP/fx" --github-output
+      - name: Run the Action
+        id: scan
+        continue-on-error: true
+        uses: ./
+        with:
+          path: ${{ steps.case.outputs.path }}
+          fail-on: ${{ steps.case.outputs.fail-on }}
+          probe: ${{ steps.case.outputs.probe }}
+          probe-private: ${{ steps.case.outputs.probe-private }}
+          comment: ${{ steps.case.outputs.comment }}
+          sarif-upload: ${{ steps.case.outputs.sarif-upload }}
+          telemetry: ${{ steps.case.outputs.telemetry }}
+      - name: Check the result
+        if: always()
+        env:
+          CASE: ${{ matrix.case }}
+          SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
+          SW_OUT_FINDINGS: ${{ steps.scan.outputs.findings }}
+          SW_OUT_SARIF: ${{ steps.scan.outputs.sarif-file }}
+          SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
+          SW_ANNOTATIONS_FILE: ${{ runner.temp }}/spellwarden-annotations.txt
+          SW_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: python fixtures/check.py "$CASE" "$RUNNER_TEMP/spellwarden.json" "$SW_OUT_EXIT" env
+
+  base-settings:
+    # Spec 9.5: on a pull request the settings file comes from the base commit. The case scans a committed directory
+    # of this checkout (actions/checkout's defaults: depth 1, persisted credentials), so the scanner fetches the base
+    # commit once from origin and reports settings_from_base. That commit must already hold the case: the pull request
+    # that adds it (a release branch into main) skips the case through the guard step, and every later one runs it.
+    name: base-settings (pull request)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Does the base commit hold this case yet?
+        id: base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/base_has_case.sh fixtures/base-settings/repo/.spellwarden/config.yml
+      - name: Run the Action on the committed fixture directory
+        id: scan
+        if: steps.base.outputs.present == 'true'
+        continue-on-error: true
+        uses: ./
+        with:
+          path: fixtures/base-settings/repo
+          comment: "false"
+          sarif-upload: "false"
+          telemetry: "false"
+      - name: Check the result
+        if: always() && steps.base.outputs.present == 'true'
+        env:
+          SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
+          SW_OUT_FINDINGS: ${{ steps.scan.outputs.findings }}
+          SW_OUT_SARIF: ${{ steps.scan.outputs.sarif-file }}
+          SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
+        run: python fixtures/check.py base-settings "$RUNNER_TEMP/spellwarden.json" "$SW_OUT_EXIT" env
+
+  telemetry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Start the loopback ping listener
+        run: |
+          python fixtures/ping_listener.py 8765 "$RUNNER_TEMP/ping.json" &
+          for _ in $(seq 50); do
+            if [ -f "$RUNNER_TEMP/ping.json.ready" ]; then break; fi
+            sleep 0.2
+          done
+          test -f "$RUNNER_TEMP/ping.json.ready"
+      - name: Build the fixture repository
+        id: case
+        run: python fixtures/make_repo.py telemetry "$RUNNER_TEMP/fx" --github-output
+      - name: Run the Action with telemetry on
+        id: scan
+        continue-on-error: true
+        uses: ./
+        with:
+          path: ${{ steps.case.outputs.path }}
+          comment: "false"
+          sarif-upload: "false"
+          telemetry: ${{ steps.case.outputs.telemetry }}
+      - name: Check the result and the ping body
+        if: always()
+        env:
+          SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
+          SW_OUT_FINDINGS: ${{ steps.scan.outputs.findings }}
+          SW_OUT_SARIF: ${{ steps.scan.outputs.sarif-file }}
+          SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
+          SW_PING_FILE: ${{ runner.temp }}/ping.json
+        run: python fixtures/check.py telemetry "$RUNNER_TEMP/spellwarden.json" "$SW_OUT_EXIT" env
