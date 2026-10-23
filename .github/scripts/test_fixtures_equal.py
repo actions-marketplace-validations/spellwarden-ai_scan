@@ -44,6 +44,11 @@ def main() -> int:
         problems.append("fake_api.py: missing in the Action or in spellwarden-oss")
     elif fake.read_bytes() != original.read_bytes():
         problems.append("fake_api.py differs from spellwarden-oss/fixtures/ci/fake_api.py")
+    script, original_script = ROOT / ".github" / "scripts" / "connected-script.json", SIBLING / "fixtures" / "ci" / "script.json"
+    if not script.is_file() or not original_script.is_file():
+        problems.append("connected-script.json: missing in the Action or in spellwarden-oss")
+    elif script.read_bytes() != original_script.read_bytes():
+        problems.append("connected-script.json differs from spellwarden-oss/fixtures/ci/script.json")
     for problem in problems:
         print(f"FAIL {problem}")
     if not problems:

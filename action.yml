@@ -226,11 +226,13 @@ runs:
         SW_PROBE: ${{ inputs.probe }}
         SW_PROBE_PRIVATE: ${{ inputs.probe-private }}
         SW_TELEMETRY: ${{ inputs.telemetry }}
-        # Connected mode (O3 spec 10): the scanner reads these itself and performs the OIDC request itself. Empty means off.
-        SPELLWARDEN_ORG: ${{ inputs.org }}
-        SPELLWARDEN_API_KEY: ${{ inputs.api-key }}
+        # Connected mode (O3 spec 10): the scanner reads SPELLWARDEN_ORG, SPELLWARDEN_API_KEY and SPELLWARDEN_DEFAULT_BRANCH
+        # itself and performs the OIDC request itself. The inputs are exported below only when set, so an empty input
+        # leaves a value the job set at its level alone (the engine README's `env: SPELLWARDEN_API_KEY` form keeps working).
+        SW_ORG: ${{ inputs.org }}
+        SW_API_KEY: ${{ inputs.api-key }}
         SW_CONNECTED_UPLOAD: ${{ inputs.upload }}
-        SPELLWARDEN_DEFAULT_BRANCH: ${{ inputs.default-branch || github.event.repository.default_branch }}
+        SW_DEFAULT_BRANCH: ${{ inputs.default-branch || github.event.repository.default_branch }}
       run: |
         out="$RUNNER_TEMP/spellwarden"
         rm -f "$out.sarif" "$out.md" "$out.json"
@@ -244,6 +246,9 @@ runs:
         # The scanner ranks SPELLWARDEN_UPLOAD above `connected.upload` of the settings file. So only `upload: false` is
         # passed on; the default "true" is no override, and the file (or a SPELLWARDEN_UPLOAD the job sets) decides.
         if [ "$SW_CONNECTED_UPLOAD" = "false" ]; then export SPELLWARDEN_UPLOAD=false; fi
+        if [ -n "$SW_ORG" ]; then export SPELLWARDEN_ORG="$SW_ORG"; fi
+        if [ -n "$SW_API_KEY" ]; then export SPELLWARDEN_API_KEY="$SW_API_KEY"; fi
+        if [ -n "$SW_DEFAULT_BRANCH" ]; then export SPELLWARDEN_DEFAULT_BRANCH="$SW_DEFAULT_BRANCH"; fi
         args+=(--format sarif --output "$out.sarif" --format markdown --output "$out.md"
                --format json --output "$out.json")
         # The text report names directories of the scanned revision, and a log line that starts with :: is a
@@ -277,12 +282,14 @@ runs:
         except (OSError, ValueError, KeyError, TypeError):
             state = {"SW_EXIT": 2, "SW_FINDINGS": 0, "SW_SARIF": "", "SW_CONNECTED": "false", "SW_DASHBOARD_URL": ""}
         else:
-            # Connected mode (spec 6.9): a `connected` object means the session was established; the notice
-            # `connected_fallback` means it was not and the scan used the baseline rules. The address is written to a
-            # line-based file, so only a plain address is passed on.
+            # Connected mode (spec 6.9): a `connected` object means the session was established; one of the free-mode
+            # notices (`connected_fallback`, `fork_free_mode`, `dependabot_free_mode`) means connected mode was asked for
+            # and the scan used the baseline rules. The address is written to a line-based file, so only a plain address
+            # is passed on.
             block = report.get("connected")
             notices = report.get("notices")
-            fell_back = isinstance(notices, list) and any(isinstance(n, dict) and n.get("code") == "connected_fallback" for n in notices)
+            free_mode = {"connected_fallback", "fork_free_mode", "dependabot_free_mode"}
+            fell_back = isinstance(notices, list) and any(isinstance(n, dict) and n.get("code") in free_mode for n in notices)
             upload = block.get("upload") if isinstance(block, dict) else None
             url = upload.get("url") if isinstance(upload, dict) else None
             if not (isinstance(url, str) and len(url) <= 2048 and re.fullmatch(r"https?://[\x21-\x7e]+", url)):

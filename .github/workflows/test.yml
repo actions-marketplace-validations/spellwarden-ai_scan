@@ -31,6 +31,10 @@ jobs:
         run: python3 .github/scripts/test_base_has_case.py
       - name: The shared fixtures and the loopback fake are copies of the command repository's (skipped without it)
         run: python3 .github/scripts/test_fixtures_equal.py
+      - name: The upload input is no override of the settings file
+        run: python3 .github/scripts/test_upload_precedence.py
+      - name: The log checker of the key legs finds a key in every form it could take
+        run: python3 .github/scripts/test_log_for_key.py
 
   fixtures:
     name: ${{ matrix.case }} on ${{ matrix.os }}
@@ -272,6 +276,9 @@ jobs:
           - {name: api-key, case: "connected@key", credential: key, event: push}
           - {name: api-key-malformed, case: "connected@key", credential: malformed, event: push}
           - {name: pull-request-target, case: connected, credential: org, event: pull_request_target}
+          # `org` set and no token variables: connected mode was asked for and could not start, so the output is `fallback`,
+          # the first line says so, and the fake sees no request (finding r0:F4).
+          - {name: org-no-token, case: connected, credential: none, event: push}
           # The repository opts out of the upload in its settings file and leaves the `upload` input at its default: the
           # input is no override, so nothing may be uploaded (finding r0:F1).
           - {name: upload-off-in-file, case: connected, credential: org, event: push, optout: "true"}
@@ -417,6 +424,7 @@ jobs:
               "org": [("GET", "/idtoken"), ("POST", "/api/public/ci/token"), policy, check, scans],
               "key": [("GET", "/api/v1/orgs"), policy, check, scans],
               "malformed": [],
+              "none": [],
           }[credential]
           if optout:
               wanted = [call for call in wanted if call != scans]  # connected.upload: false in the file: no POST /ci/scans
@@ -434,6 +442,16 @@ jobs:
                   problems.append("a scan ran although the key was refused")
           elif not (temp / "spellwarden.json").is_file() or not (temp / "spellwarden.md").is_file():
               problems.append("the scan wrote no JSON report or no comment file")
+          elif credential == "none":
+              # connected mode was asked for with `org` and no token could be requested: the free scan with the fallback notice
+              if os.environ["SW_OUT_CONNECTED"] != "fallback" or os.environ["SW_OUT_DASHBOARD"] != "":
+                  problems.append(f"the connected output is {os.environ['SW_OUT_CONNECTED']!r}, expected 'fallback' and no dashboard url")
+              report = json.loads((temp / "spellwarden.json").read_text(encoding="utf-8"))
+              codes = [n.get("code") for n in report.get("notices", [])]
+              if "connected" in report or "connected_fallback" not in codes:
+                  problems.append(f"the report has notices {codes} and connected {report.get('connected')!r}, expected connected_fallback and no block")
+              if not (temp / "spellwarden.md").read_text(encoding="utf-8").startswith("Connected mode was not available"):
+                  problems.append("the comment file does not start with the fallback line")
           else:
               if os.environ["SW_OUT_CONNECTED"] != "true":
                   problems.append(f"the connected output is {os.environ['SW_OUT_CONNECTED']!r}, expected 'true'")
@@ -478,6 +496,8 @@ jobs:
               print("connected-case-ok")
           sys.exit(1 if problems else 0)
           PY
+      # A textual check: the step's `if:` reads the real event, which this workflow cannot set, so the expression
+      # is asserted as text (build review r0:F4).
       - name: The comment step also runs on pull_request_target
         if: matrix.event == 'pull_request_target'
         shell: bash
@@ -515,7 +535,13 @@ jobs:
             esac
             id="$(printf '%s\n' "$jobs" | awk -F '\t' -v name="connected ($leg)" '$2 == name { print $1 }')"
             test -n "$id"
-            gh api "repos/$GH_REPO/actions/jobs/$id/logs" > "$RUNNER_TEMP/log-$leg.txt"
-            test -s "$RUNNER_TEMP/log-$leg.txt"
+            # the log of a job that just finished can be missing or empty for a short while: bounded retries, then fail
+            for attempt in 1 2 3 4 5 6; do
+              if gh api "repos/$GH_REPO/actions/jobs/$id/logs" > "$RUNNER_TEMP/log-$leg.txt" 2>/dev/null && test -s "$RUNNER_TEMP/log-$leg.txt"; then
+                break
+              fi
+              if [ "$attempt" = 6 ]; then echo "the log of connected ($leg) was not available after 6 tries"; exit 1; fi
+              sleep 10
+            done
             SW_KEY="$key" python3 -I .github/scripts/check_log_for_key.py "$RUNNER_TEMP/log-$leg.txt"
           done
