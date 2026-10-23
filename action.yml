@@ -42,6 +42,22 @@ inputs:
     description: The token used for the pull request comment and the SARIF upload.
     required: false
     default: ${{ github.token }}
+  org:
+    description: "Your Spellwarden organisation slug. Turns on connected mode through a CI connection: the job needs `permissions: id-token: write`."
+    required: false
+    default: ""
+  api-key:
+    description: "A CI key (access CI) from Settings, API keys, for pipelines that cannot use a CI connection. Pass it from a secret."
+    required: false
+    default: ""
+  upload:
+    description: "false keeps the results of a connected scan on the runner. The default true changes nothing: the repository's settings file (connected.upload) decides. Used only in connected mode."
+    required: false
+    default: "true"
+  default-branch:
+    description: "The default branch, for scheduled runs whose event payload does not name it."
+    required: false
+    default: ""
   requirements-file:
     description: "Test hook only: an alternative hash-pinned requirements file. Leave it empty."
     required: false
@@ -57,6 +73,12 @@ outputs:
   sarif-file:
     description: The path of the SARIF file, empty when none was written.
     value: ${{ steps.result.outputs.sarif-file }}
+  connected:
+    description: "true when the scan ran in connected mode, fallback when connected mode was not available and the scan used the baseline rules only, false otherwise."
+    value: ${{ steps.result.outputs.connected }}
+  dashboard-url:
+    description: The address of the repository in your Spellwarden organisation when the results were uploaded, empty otherwise.
+    value: ${{ steps.result.outputs.dashboard-url }}
 
 runs:
   using: composite
@@ -71,7 +93,12 @@ runs:
         SW_COMMENT: ${{ inputs.comment }}
         SW_SARIF_UPLOAD: ${{ inputs.sarif-upload }}
         SW_TELEMETRY: ${{ inputs.telemetry }}
+        SW_ORG: ${{ inputs.org }}
+        SW_CONNECTED_UPLOAD: ${{ inputs.upload }}
+        SPELLWARDEN_API_KEY: ${{ inputs.api-key }}
       run: |
+        # The key is masked before anything else runs, and no message below carries it.
+        if [ -n "$SPELLWARDEN_API_KEY" ]; then printf '::add-mask::%s\n' "$SPELLWARDEN_API_KEY"; fi
         {
           echo "SW_EXIT=2"
           echo "SW_FINDINGS=0"
@@ -81,8 +108,11 @@ runs:
           echo "SW_READY="
           echo "SW_PY="
           echo "SW_UPLOAD="
+          echo "SW_CONNECTED=false"
+          echo "SW_DASHBOARD_URL="
         } >> "$GITHUB_ENV"
         bad=""
+        message=""
         case "$SW_FAIL_ON" in
           critical|high|medium|low|never) ;;
           *) bad="fail-on (expected critical, high, medium, low or never)" ;;
@@ -94,15 +124,31 @@ runs:
           esac
         fi
         for pair in "probe=$SW_PROBE" "probe-private=$SW_PROBE_PRIVATE" "comment=$SW_COMMENT" \
-                    "sarif-upload=$SW_SARIF_UPLOAD" "telemetry=$SW_TELEMETRY"; do
+                    "sarif-upload=$SW_SARIF_UPLOAD" "telemetry=$SW_TELEMETRY" "upload=$SW_CONNECTED_UPLOAD"; do
           if [ -n "$bad" ]; then break; fi
           case "${pair#*=}" in
             true|false) ;;
             *) bad="${pair%%=*} (expected true or false)" ;;
           esac
         done
+        # The patterns sit in variables and are read in the C locale: the same reading in every bash, and a value
+        # with a line break cannot match. The key is compared in this shell, never passed as an argument.
+        export LC_ALL=C
+        org_pattern='^[a-z0-9-]{2,64}$'
+        key_pattern='^swk_[A-Za-z0-9_-]{40}$'
+        if [ -z "$bad" ] && [ -n "$SW_ORG" ] && ! [[ $SW_ORG =~ $org_pattern ]]; then
+          bad="org (expected your organisation slug: 2 to 64 lower-case letters, digits and hyphens)"
+        fi
+        if [ -z "$bad" ] && [ -n "$SPELLWARDEN_API_KEY" ] && ! [[ $SPELLWARDEN_API_KEY =~ $key_pattern ]]; then
+          bad="api-key (expected a CI key, which starts with swk_; the value is not shown)"
+        fi
         if [ -n "$bad" ]; then
-          echo "::error title=Spellwarden::The input $bad has a value the Action does not accept."
+          message="The input $bad has a value the Action does not accept."
+        elif [ -n "$SW_ORG" ] && [ -n "$SPELLWARDEN_API_KEY" ]; then
+          message="The inputs org and api-key are both set. Use org with a CI connection, or api-key alone, not both."
+        fi
+        if [ -n "$message" ]; then
+          echo "::error title=Spellwarden::$message"
           exit 0
         fi
         echo "SW_VALID=true" >> "$GITHUB_ENV"
@@ -180,6 +226,13 @@ runs:
         SW_PROBE: ${{ inputs.probe }}
         SW_PROBE_PRIVATE: ${{ inputs.probe-private }}
         SW_TELEMETRY: ${{ inputs.telemetry }}
+        # Connected mode (O3 spec 10): the scanner reads SPELLWARDEN_ORG, SPELLWARDEN_API_KEY and SPELLWARDEN_DEFAULT_BRANCH
+        # itself and performs the OIDC request itself. The inputs are exported below only when set, so an empty input
+        # leaves a value the job set at its level alone (the engine README's `env: SPELLWARDEN_API_KEY` form keeps working).
+        SW_ORG: ${{ inputs.org }}
+        SW_API_KEY: ${{ inputs.api-key }}
+        SW_CONNECTED_UPLOAD: ${{ inputs.upload }}
+        SW_DEFAULT_BRANCH: ${{ inputs.default-branch || github.event.repository.default_branch }}
       run: |
         out="$RUNNER_TEMP/spellwarden"
         rm -f "$out.sarif" "$out.md" "$out.json"
@@ -190,6 +243,12 @@ runs:
         if [ "$SW_PROBE" = "true" ]; then args+=(--probe); else args+=(--no-probe); fi
         if [ "$SW_PROBE_PRIVATE" = "true" ]; then args+=(--probe-private); else args+=(--no-probe-private); fi
         if [ "$SW_TELEMETRY" = "false" ]; then args+=(--no-telemetry); fi
+        # The scanner ranks SPELLWARDEN_UPLOAD above `connected.upload` of the settings file. So only `upload: false` is
+        # passed on; the default "true" is no override, and the file (or a SPELLWARDEN_UPLOAD the job sets) decides.
+        if [ "$SW_CONNECTED_UPLOAD" = "false" ]; then export SPELLWARDEN_UPLOAD=false; fi
+        if [ -n "$SW_ORG" ]; then export SPELLWARDEN_ORG="$SW_ORG"; fi
+        if [ -n "$SW_API_KEY" ]; then export SPELLWARDEN_API_KEY="$SW_API_KEY"; fi
+        if [ -n "$SW_DEFAULT_BRANCH" ]; then export SPELLWARDEN_DEFAULT_BRANCH="$SW_DEFAULT_BRANCH"; fi
         args+=(--format sarif --output "$out.sarif" --format markdown --output "$out.md"
                --format json --output "$out.json")
         # The text report names directories of the scanned revision, and a log line that starts with :: is a
@@ -212,6 +271,7 @@ runs:
         "$SW_PY" -I - "$out.json" "$code" "$out.sarif" <<'PY'
         import json
         import os
+        import re
         import sys
 
         report_path, code, sarif = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -220,9 +280,23 @@ runs:
                 report = json.load(handle)
             findings = sum(1 for finding in report["findings"] if not finding["suppressed"])
         except (OSError, ValueError, KeyError, TypeError):
-            state = {"SW_EXIT": 2, "SW_FINDINGS": 0, "SW_SARIF": ""}
+            state = {"SW_EXIT": 2, "SW_FINDINGS": 0, "SW_SARIF": "", "SW_CONNECTED": "false", "SW_DASHBOARD_URL": ""}
         else:
-            state = {"SW_EXIT": code, "SW_FINDINGS": findings, "SW_SARIF": sarif if os.path.isfile(sarif) else ""}
+            # Connected mode (spec 6.9): a `connected` object means the session was established; one of the free-mode
+            # notices (`connected_fallback`, `fork_free_mode`, `dependabot_free_mode`) means connected mode was asked for
+            # and the scan used the baseline rules. The address is written to a line-based file, so only a plain address
+            # is passed on.
+            block = report.get("connected")
+            notices = report.get("notices")
+            free_mode = {"connected_fallback", "fork_free_mode", "dependabot_free_mode"}
+            fell_back = isinstance(notices, list) and any(isinstance(n, dict) and n.get("code") in free_mode for n in notices)
+            upload = block.get("upload") if isinstance(block, dict) else None
+            url = upload.get("url") if isinstance(upload, dict) else None
+            if not (isinstance(url, str) and len(url) <= 2048 and re.fullmatch(r"https?://[\x21-\x7e]+", url)):
+                url = ""
+            state = {"SW_EXIT": code, "SW_FINDINGS": findings, "SW_SARIF": sarif if os.path.isfile(sarif) else "",
+                     "SW_CONNECTED": "true" if isinstance(block, dict) else ("fallback" if fell_back else "false"),
+                     "SW_DASHBOARD_URL": url}
         with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
             for key, value in state.items():
                 handle.write(f"{key}={value}\n")
@@ -277,7 +351,7 @@ runs:
         echo "::warning title=Spellwarden::sarif_upload_failed: the SARIF file was not uploaded to code scanning. Usual causes: the workflow does not grant security-events: write, the repository is private without GitHub Code Security, or the upload service failed. See the log of the upload step. The check result is the scan's."
 
     - name: Pull request comment
-      if: env.SW_READY == 'true' && inputs.comment == 'true' && github.event_name == 'pull_request'
+      if: env.SW_READY == 'true' && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.token }}
@@ -311,9 +385,15 @@ runs:
         case "$findings" in ''|*[!0-9]*) findings=0 ;; esac
         sarif=""
         if [ -n "${SW_SARIF:-}" ] && [ -f "$SW_SARIF" ]; then sarif="$SW_SARIF"; fi
+        connected="${SW_CONNECTED:-false}"
+        case "$connected" in true|false|fallback) ;; *) connected=false ;; esac
+        dashboard="${SW_DASHBOARD_URL:-}"
+        case "$dashboard" in ''|*[![:graph:]]*) dashboard="" ;; esac
         {
           echo "exit-code=$exit_code"
           echo "findings=$findings"
           echo "sarif-file=$sarif"
+          echo "connected=$connected"
+          echo "dashboard-url=$dashboard"
         } >> "$GITHUB_OUTPUT"
         exit "$exit_code"
