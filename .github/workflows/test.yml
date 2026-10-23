@@ -258,7 +258,8 @@ jobs:
     # hash-pinned requirements-file (spellwarden 1.2.0), since requirements.txt pins 1.0.0 until the release script runs.
     # The runner sets the GITHUB_* variables of the event itself, so each case writes the context it needs into a file
     # that bash reads at the start of every step of the Action (BASH_ENV); the check proves it took effect (run kind,
-    # head commit). A key is built here at run time, never written as one literal, and masked as a secret would be.
+    # head commit). A key is built here at run time, never written as one literal. Nothing here masks it: only the Action
+    # does, and the job `connected-log` below reads the logs of the two key legs and fails if the key shows in them (r0:F2).
     name: connected (${{ matrix.name }})
     runs-on: ubuntu-latest
     env:
@@ -303,7 +304,6 @@ jobs:
             malformed) value="${prefix}k_short" ;;
             *) value="" ;;
           esac
-          if [ -n "$value" ]; then echo "::add-mask::$value"; fi
           echo "value=$value" >> "$GITHUB_OUTPUT"
       - name: Write the run context of the event
         shell: bash
@@ -482,3 +482,40 @@ jobs:
         if: matrix.event == 'pull_request_target'
         shell: bash
         run: grep -q "github.event_name == 'pull_request_target'" action.yml
+
+  connected-log:
+    # Finding r0:F2 (spec 10, invariant 2): the key never shows in the log of the Action. The `connected` job does not mask the
+    # key it passes, so only the Action's own `::add-mask::` can hide it; this job downloads the logs of the two key legs through
+    # the REST API and fails if the key (rebuilt here, as the legs built it) shows anywhere after the step headers the runner
+    # prints before the Action runs (see check_log_for_key.py).
+    name: connected, the key is not in the log
+    needs: connected
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Download the logs of the key legs and look for the key
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          prefix=sw
+          jobs="$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" --jq '.jobs[] | [.id, .name] | @tsv')"
+          for leg in api-key api-key-malformed; do
+            case "$leg" in
+              api-key) key="${prefix}k_$(head -c 40 /dev/zero | tr '\0' a)" ;;
+              *) key="${prefix}k_short" ;;
+            esac
+            id="$(printf '%s\n' "$jobs" | awk -F '\t' -v name="connected ($leg)" '$2 == name { print $1 }')"
+            test -n "$id"
+            gh api "repos/$GH_REPO/actions/jobs/$id/logs" > "$RUNNER_TEMP/log-$leg.txt"
+            test -s "$RUNNER_TEMP/log-$leg.txt"
+            SW_KEY="$key" python3 -I .github/scripts/check_log_for_key.py "$RUNNER_TEMP/log-$leg.txt"
+          done
