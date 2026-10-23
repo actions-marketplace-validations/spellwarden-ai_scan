@@ -381,7 +381,9 @@ jobs:
           default-branch: ${{ steps.case.outputs.default-branch }}
           requirements-file: .github/connected-requirements.txt
       - name: Check the case
-        if: always() && matrix.credential != 'malformed' && matrix.optout != 'true'
+        # the malformed-key, no-token and opt-out legs do not produce the connected case's result; the next step holds
+        # their expectations
+        if: always() && matrix.credential != 'malformed' && matrix.credential != 'none' && matrix.optout != 'true'
         shell: bash
         env:
           CASE: ${{ matrix.case }}
@@ -541,7 +543,8 @@ jobs:
             test -n "$id"
             # the log of a job that just finished can be missing or empty for a short while: bounded retries, then fail
             for attempt in 1 2 3 4 5 6; do
-              if gh api "repos/$GH_REPO/actions/jobs/$id/logs" > "$RUNNER_TEMP/log-$leg.txt" 2> "$RUNNER_TEMP/log-$leg.err" && test -s "$RUNNER_TEMP/log-$leg.txt"; then
+              # the log carries the runner's colour codes, which gh refuses to print without --allow-escape-sequences
+              if gh api --allow-escape-sequences "repos/$GH_REPO/actions/jobs/$id/logs" > "$RUNNER_TEMP/log-$leg.txt" 2> "$RUNNER_TEMP/log-$leg.err" && test -s "$RUNNER_TEMP/log-$leg.txt"; then
                 break
               fi
               echo "attempt $attempt: the log of connected ($leg), job $id, is not available yet: $(head -c 400 "$RUNNER_TEMP/log-$leg.err" | tr '\n' ' ')"
