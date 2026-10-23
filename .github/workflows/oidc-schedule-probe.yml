@@ -1,0 +1,38 @@
+name: oidc-schedule-probe
+
+# Temporary, removed after one scheduled run: asks GitHub for an OIDC token with the Spellwarden probe audience and prints only its decoded header
+# and claims (never the signature), for the O3 release-gate recordings (spec 12.1). Deleted after recording.
+on:
+  schedule:
+    - cron: "11,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request a token and print its decoded header and claims
+        env:
+          AUDIENCE: https://dash.spellwarden.ai/ci/probe
+        run: |
+          python3 - <<'PY'
+          import base64, datetime, json, os, urllib.parse, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + urllib.parse.quote(os.environ["AUDIENCE"], safe="")
+          req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(req))["value"]
+          def part(i):
+              s = token.split(".")[i]
+              return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+          env_keys = ["GITHUB_BASE_REF", "GITHUB_EVENT_NAME", "GITHUB_HEAD_REF", "GITHUB_REF", "GITHUB_REF_NAME",
+                      "GITHUB_REF_PROTECTED", "GITHUB_SHA"]
+          out = {"header": part(0), "claims": part(1), "env": {k: os.environ.get(k, "") for k in env_keys},
+                 "recorded_at": datetime.date.today().isoformat(),
+                 "token_endpoint_host": urllib.parse.urlsplit(url).hostname}
+          print("---PROBE-BEGIN---")
+          print(json.dumps(out, sort_keys=True))
+          print("---PROBE-END---")
+          PY
