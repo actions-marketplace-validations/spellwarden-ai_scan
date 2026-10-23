@@ -450,8 +450,12 @@ jobs:
               codes = [n.get("code") for n in report.get("notices", [])]
               if "connected" in report or "connected_fallback" not in codes:
                   problems.append(f"the report has notices {codes} and connected {report.get('connected')!r}, expected connected_fallback and no block")
-              if not (temp / "spellwarden.md").read_text(encoding="utf-8").startswith("Connected mode was not available"):
-                  problems.append("the comment file does not start with the fallback line")
+              # the comment opens with the marker and the summary line; the fallback line sits under the "Connected mode"
+              # heading in the Markdown wording, its underscores escaped (engine output/markdown.py:connected_section)
+              comment = (temp / "spellwarden.md").read_text(encoding="utf-8")
+              fallback_line = "Connected mode unavailable (connected\\_no\\_credential): baseline rules only, nothing uploaded."
+              if "**Connected mode**" not in comment or fallback_line not in comment:
+                  problems.append("the comment file has no Connected mode heading with the fallback line")
           else:
               if os.environ["SW_OUT_CONNECTED"] != "true":
                   problems.append(f"the connected output is {os.environ['SW_OUT_CONNECTED']!r}, expected 'true'")
@@ -537,9 +541,10 @@ jobs:
             test -n "$id"
             # the log of a job that just finished can be missing or empty for a short while: bounded retries, then fail
             for attempt in 1 2 3 4 5 6; do
-              if gh api "repos/$GH_REPO/actions/jobs/$id/logs" > "$RUNNER_TEMP/log-$leg.txt" 2>/dev/null && test -s "$RUNNER_TEMP/log-$leg.txt"; then
+              if gh api "repos/$GH_REPO/actions/jobs/$id/logs" > "$RUNNER_TEMP/log-$leg.txt" 2> "$RUNNER_TEMP/log-$leg.err" && test -s "$RUNNER_TEMP/log-$leg.txt"; then
                 break
               fi
+              echo "attempt $attempt: the log of connected ($leg), job $id, is not available yet: $(head -c 400 "$RUNNER_TEMP/log-$leg.err" | tr '\n' ' ')"
               if [ "$attempt" = 6 ]; then echo "the log of connected ($leg) was not available after 6 tries"; exit 1; fi
               sleep 10
             done
