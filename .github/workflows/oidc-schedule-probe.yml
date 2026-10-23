@@ -3,12 +3,8 @@ name: oidc-schedule-probe
 # Temporary, removed after one scheduled run: asks GitHub for an OIDC token with the Spellwarden probe audience and prints only its decoded header
 # and claims (never the signature), for the O3 release-gate recordings (spec 12.1). Deleted after recording.
 on:
-  push:
-    branches: ["main"]
   schedule:
-    - cron: "*/5 * * * *"
-  merge_group:
-  pull_request_target:
+    - cron: "11,37 * * * *"
   workflow_dispatch:
 
 permissions:
