@@ -271,6 +271,9 @@ jobs:
           - {name: api-key, case: "connected@key", credential: key, event: push}
           - {name: api-key-malformed, case: "connected@key", credential: malformed, event: push}
           - {name: pull-request-target, case: connected, credential: org, event: pull_request_target}
+          # The repository opts out of the upload in its settings file and leaves the `upload` input at its default: the
+          # input is no override, so nothing may be uploaded (finding r0:F1).
+          - {name: upload-off-in-file, case: connected, credential: org, event: push, optout: "true"}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -282,6 +285,12 @@ jobs:
         env:
           CASE: ${{ matrix.case }}
         run: python fixtures/make_repo.py "$CASE" "$RUNNER_TEMP/fx" --github-output
+      - name: Write the settings file that turns the upload off
+        if: matrix.optout == 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/fx/.spellwarden"
+          printf 'version: 1\nconnected:\n  upload: false\n' > "$RUNNER_TEMP/fx/.spellwarden/config.yml"
       - name: Build the key this case passes
         id: key
         shell: bash
@@ -365,7 +374,7 @@ jobs:
           default-branch: ${{ steps.case.outputs.default-branch }}
           requirements-file: .github/connected-requirements.txt
       - name: Check the case
-        if: always() && matrix.credential != 'malformed'
+        if: always() && matrix.credential != 'malformed' && matrix.optout != 'true'
         shell: bash
         env:
           CASE: ${{ matrix.case }}
@@ -380,6 +389,7 @@ jobs:
         env:
           SW_CREDENTIAL: ${{ matrix.credential }}
           SW_EVENT: ${{ matrix.event }}
+          SW_OPTOUT: ${{ matrix.optout }}
           SW_KEY: ${{ steps.key.outputs.value }}
           SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
           SW_OUT_CONNECTED: ${{ steps.scan.outputs.connected }}
@@ -397,6 +407,7 @@ jobs:
 
           temp = Path(os.environ["RUNNER_TEMP"])
           credential, event, key = os.environ["SW_CREDENTIAL"], os.environ["SW_EVENT"], os.environ["SW_KEY"]
+          optout = os.environ["SW_OPTOUT"] == "true"
           problems = []
           record_file = temp / "record.json"
           requests = json.loads(record_file.read_text(encoding="utf-8")) if record_file.is_file() else []
@@ -407,6 +418,8 @@ jobs:
               "key": [("GET", "/api/v1/orgs"), policy, check, scans],
               "malformed": [],
           }[credential]
+          if optout:
+              wanted = [call for call in wanted if call != scans]  # connected.upload: false in the file: no POST /ci/scans
           if sequence != wanted:
               problems.append(f"the fake saw {sequence}, expected {wanted}")
           if any(r.get("unscripted") for r in requests):
@@ -424,7 +437,8 @@ jobs:
           else:
               if os.environ["SW_OUT_CONNECTED"] != "true":
                   problems.append(f"the connected output is {os.environ['SW_OUT_CONNECTED']!r}, expected 'true'")
-              if os.environ["SW_OUT_DASHBOARD"] != "https://dash.spellwarden.ai/acme/repositories/r1":
+              expected_url = "" if optout else "https://dash.spellwarden.ai/acme/repositories/r1"
+              if os.environ["SW_OUT_DASHBOARD"] != expected_url:
                   problems.append(f"the dashboard-url output is {os.environ['SW_OUT_DASHBOARD']!r}")
               report = json.loads((temp / "spellwarden.json").read_text(encoding="utf-8"))
               block = report.get("connected") or {}
@@ -443,8 +457,13 @@ jobs:
               # the comment file the Action's comment step posts: the connected line of the text output (spec 6.10)
               comment = (temp / "spellwarden.md").read_text(encoding="utf-8")
               line = re.compile(r"^Connected to Acme as github:github\.com/\S+ \((oidc|key)\): .*$", re.MULTILINE)
-              if not line.search(comment) or "Results: <https://dash.spellwarden.ai/acme/repositories/r1>" not in comment:
-                  problems.append("spellwarden.md has no connected line or no results link")
+              if not line.search(comment):
+                  problems.append("spellwarden.md has no connected line")
+              if optout:
+                  if (block.get("upload") or {}).get("status") != "skipped" or "Results: <" in comment:
+                      problems.append(f"the upload is {block.get('upload')!r}, expected skipped")
+              elif "Results: <https://dash.spellwarden.ai/acme/repositories/r1>" not in comment:
+                  problems.append("spellwarden.md has no results link")
           if key:
               places = [temp / "spellwarden.json", temp / "spellwarden.md", temp / "spellwarden.sarif",
                         temp / "spellwarden-annotations.txt"]

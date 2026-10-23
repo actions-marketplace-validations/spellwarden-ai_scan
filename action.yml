@@ -51,7 +51,7 @@ inputs:
     required: false
     default: ""
   upload:
-    description: "true uploads the results of a connected scan to your organisation; false keeps them on the runner. Used only in connected mode."
+    description: "false keeps the results of a connected scan on the runner. The default true changes nothing: the repository's settings file (connected.upload) decides. Used only in connected mode."
     required: false
     default: "true"
   default-branch:
@@ -229,7 +229,7 @@ runs:
         # Connected mode (O3 spec 10): the scanner reads these itself and performs the OIDC request itself. Empty means off.
         SPELLWARDEN_ORG: ${{ inputs.org }}
         SPELLWARDEN_API_KEY: ${{ inputs.api-key }}
-        SPELLWARDEN_UPLOAD: ${{ inputs.upload }}
+        SW_CONNECTED_UPLOAD: ${{ inputs.upload }}
         SPELLWARDEN_DEFAULT_BRANCH: ${{ inputs.default-branch || github.event.repository.default_branch }}
       run: |
         out="$RUNNER_TEMP/spellwarden"
@@ -241,6 +241,9 @@ runs:
         if [ "$SW_PROBE" = "true" ]; then args+=(--probe); else args+=(--no-probe); fi
         if [ "$SW_PROBE_PRIVATE" = "true" ]; then args+=(--probe-private); else args+=(--no-probe-private); fi
         if [ "$SW_TELEMETRY" = "false" ]; then args+=(--no-telemetry); fi
+        # The scanner ranks SPELLWARDEN_UPLOAD above `connected.upload` of the settings file. So only `upload: false` is
+        # passed on; the default "true" is no override, and the file (or a SPELLWARDEN_UPLOAD the job sets) decides.
+        if [ "$SW_CONNECTED_UPLOAD" = "false" ]; then export SPELLWARDEN_UPLOAD=false; fi
         args+=(--format sarif --output "$out.sarif" --format markdown --output "$out.md"
                --format json --output "$out.json")
         # The text report names directories of the scanned revision, and a log line that starts with :: is a

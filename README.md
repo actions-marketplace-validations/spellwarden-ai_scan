@@ -50,7 +50,7 @@ In the default mode no secret is needed. The check result is always the scan's o
 | `token` | `${{ github.token }}` | The token for the comment and the upload. |
 | `org` | empty | Your Spellwarden organisation slug. Turns on connected mode through a CI connection: the job needs `permissions: id-token: write` (see "Connected mode"). |
 | `api-key` | empty | A CI key (access CI) from Settings, API keys, for pipelines that cannot use a CI connection. Pass it from a secret. Use `org` or `api-key`, never both. |
-| `upload` | `true` | In connected mode, `false` keeps the results on the runner instead of uploading them. |
+| `upload` | `true` | In connected mode, `false` keeps the results on the runner instead of uploading them. The default `true` changes nothing: `connected.upload` in `.spellwarden/config.yml` still decides, and the upload is on when the file says nothing. |
 | `default-branch` | empty | The default branch, for scheduled runs whose event payload does not name it. |
 | `requirements-file` | empty | A test hook for the scanner's own release tests. Leave it empty. |
 
@@ -146,7 +146,7 @@ jobs:
           org: acme
 ```
 
-`upload: false` keeps the results on the runner. `default-branch` names the default branch for scheduled runs, whose event payload does not.
+`upload: false` keeps the results on the runner, whatever the settings file says. Leaving `upload` at its default leaves the choice to `connected.upload` in `.spellwarden/config.yml`. `default-branch` names the default branch for scheduled runs, whose event payload does not.
 
 ### Turning it on with a CI key
 
