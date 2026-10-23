@@ -29,6 +29,8 @@ jobs:
         run: python3 .github/scripts/lint_action.py action.yml .github/workflows/test.yml
       - name: The base-settings guard
         run: python3 .github/scripts/test_base_has_case.py
+      - name: The shared fixtures and the loopback fake are copies of the command repository's (skipped without it)
+        run: python3 .github/scripts/test_fixtures_equal.py
 
   fixtures:
     name: ${{ matrix.case }} on ${{ matrix.os }}
@@ -247,3 +249,217 @@ jobs:
           SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
           SW_PING_FILE: ${{ runner.temp }}/ping.json
         run: python fixtures/check.py telemetry "$RUNNER_TEMP/spellwarden.json" "$SW_OUT_EXIT" env
+
+  connected:
+    # Connected mode (O3 spec 10, plan P13, P23): the Action over the `connected` fixture, against the loopback fake
+    # .github/scripts/fake_api.py (a copy of the command repository's), which plays the code host's token endpoint, the
+    # exchange and the four routes the command calls. The job has no `id-token` grant, so the runner sets no token variables
+    # and the two ACTIONS_* variables are set here, explicitly, to the fake. Every case passes the Action's own
+    # hash-pinned requirements-file (spellwarden 1.2.0), since requirements.txt pins 1.0.0 until the release script runs.
+    # The runner sets the GITHUB_* variables of the event itself, so each case writes the context it needs into a file
+    # that bash reads at the start of every step of the Action (BASH_ENV); the check proves it took effect (run kind,
+    # head commit). A key is built here at run time, never written as one literal, and masked as a secret would be.
+    name: connected (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    env:
+      SPELLWARDEN_API_URL: http://127.0.0.1:8767/api
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: org, case: connected, credential: org, event: push}
+          - {name: api-key, case: "connected@key", credential: key, event: push}
+          - {name: api-key-malformed, case: "connected@key", credential: malformed, event: push}
+          - {name: pull-request-target, case: connected, credential: org, event: pull_request_target}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the fixture repository
+        id: case
+        shell: bash
+        env:
+          CASE: ${{ matrix.case }}
+        run: python fixtures/make_repo.py "$CASE" "$RUNNER_TEMP/fx" --github-output
+      - name: Build the key this case passes
+        id: key
+        shell: bash
+        env:
+          CREDENTIAL: ${{ matrix.credential }}
+        run: |
+          prefix=sw
+          case "$CREDENTIAL" in
+            key) value="${prefix}k_$(head -c 40 /dev/zero | tr '\0' a)" ;;
+            malformed) value="${prefix}k_short" ;;
+            *) value="" ;;
+          esac
+          if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+      - name: Write the run context of the event
+        shell: bash
+        env:
+          EVENT: ${{ matrix.event }}
+        run: |
+          fx="$RUNNER_TEMP/fx"
+          head="$(git -C "$fx" rev-parse HEAD)"
+          python - "$RUNNER_TEMP" "$head" "$EVENT" <<'PY'
+          import json
+          import sys
+
+          temp, head, event = sys.argv[1], sys.argv[2], sys.argv[3]
+          payload = {"repository": {"default_branch": "main", "visibility": "private"}}
+          if event == "pull_request_target":
+              payload["number"] = 7
+              payload["pull_request"] = {
+                  "number": 7,
+                  "head": {"sha": head, "ref": "feature/x", "repo": {"full_name": "forker/tools"}},
+                  "base": {"sha": "b" * 40, "ref": "main", "repo": {"full_name": "acme/tools"}},
+              }
+          with open(temp + "/event.json", "w", encoding="utf-8") as handle:
+              json.dump(payload, handle)
+          PY
+          {
+            echo "export GITHUB_EVENT_NAME=$EVENT"
+            echo "export GITHUB_EVENT_PATH=$RUNNER_TEMP/event.json"
+            echo "export GITHUB_SHA=$head"
+            echo "export GITHUB_RUN_ATTEMPT=1"
+            if [ "$EVENT" = "pull_request_target" ]; then
+              echo "export GITHUB_HEAD_REF=feature/x"
+              echo "export GITHUB_REF_NAME=7/merge"
+              echo "export GITHUB_REF_PROTECTED=false"
+            else
+              echo "unset GITHUB_HEAD_REF"
+              echo "export GITHUB_REF_NAME=main"
+              echo "export GITHUB_REF_PROTECTED=true"
+            fi
+          } > "$RUNNER_TEMP/context.env"
+      - name: Start the loopback fake
+        shell: bash
+        run: |
+          python .github/scripts/fake_api.py --script .github/scripts/connected-script.json --port 8767 \
+            --record "$RUNNER_TEMP/record.json" --ready "$RUNNER_TEMP/fake.ready" &
+          for _ in $(seq 50); do
+            if [ -f "$RUNNER_TEMP/fake.ready" ]; then break; fi
+            sleep 0.2
+          done
+          test -f "$RUNNER_TEMP/fake.ready"
+      - name: Run the Action
+        id: scan
+        continue-on-error: true
+        uses: ./
+        env:
+          BASH_ENV: ${{ runner.temp }}/context.env
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ matrix.credential == 'org' && 'http://127.0.0.1:8767/idtoken?api-version=2.0' || '' }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ matrix.credential == 'org' && 'runner-request-token' || '' }}
+        with:
+          path: ${{ steps.case.outputs.path }}
+          fail-on: ${{ steps.case.outputs.fail-on }}
+          locked: ${{ steps.case.outputs.locked }}
+          comment: "false"
+          sarif-upload: "false"
+          telemetry: "false"
+          org: ${{ steps.case.outputs.org }}
+          api-key: ${{ steps.key.outputs.value }}
+          upload: ${{ steps.case.outputs.upload }}
+          default-branch: ${{ steps.case.outputs.default-branch }}
+          requirements-file: .github/connected-requirements.txt
+      - name: Check the case
+        if: always() && matrix.credential != 'malformed'
+        shell: bash
+        env:
+          CASE: ${{ matrix.case }}
+          SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
+          SW_OUT_FINDINGS: ${{ steps.scan.outputs.findings }}
+          SW_OUT_SARIF: ${{ steps.scan.outputs.sarif-file }}
+          SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
+        run: python fixtures/check.py "$CASE" "$RUNNER_TEMP/spellwarden.json" "$SW_OUT_EXIT" env
+      - name: Check the outputs, the comment file, the requests and the secrets
+        if: always()
+        shell: bash
+        env:
+          SW_CREDENTIAL: ${{ matrix.credential }}
+          SW_EVENT: ${{ matrix.event }}
+          SW_KEY: ${{ steps.key.outputs.value }}
+          SW_OUT_EXIT: ${{ steps.scan.outputs.exit-code }}
+          SW_OUT_CONNECTED: ${{ steps.scan.outputs.connected }}
+          SW_OUT_DASHBOARD: ${{ steps.scan.outputs.dashboard-url }}
+          SW_OUT_SARIF: ${{ steps.scan.outputs.sarif-file }}
+          SW_OUT_OUTCOME: ${{ steps.scan.outcome }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          credential, event, key = os.environ["SW_CREDENTIAL"], os.environ["SW_EVENT"], os.environ["SW_KEY"]
+          problems = []
+          record_file = temp / "record.json"
+          requests = json.loads(record_file.read_text(encoding="utf-8")) if record_file.is_file() else []
+          sequence = [(r["method"], urlsplit(r["path"]).path) for r in requests]
+          policy, check, scans = ("GET", "/api/v1/orgs/acme/ci/policy"), ("POST", "/api/v1/orgs/acme/ci/registry-check"), ("POST", "/api/v1/orgs/acme/ci/scans")
+          wanted = {
+              "org": [("GET", "/idtoken"), ("POST", "/api/public/ci/token"), policy, check, scans],
+              "key": [("GET", "/api/v1/orgs"), policy, check, scans],
+              "malformed": [],
+          }[credential]
+          if sequence != wanted:
+              problems.append(f"the fake saw {sequence}, expected {wanted}")
+          if any(r.get("unscripted") for r in requests):
+              problems.append("a request the fake had no script for")
+          if credential == "malformed":
+              # refused by the validation step: no scan, no request, the check fails with exit code 2 and says nothing connected
+              if os.environ["SW_OUT_EXIT"] != "2" or os.environ["SW_OUT_OUTCOME"] != "failure":
+                  problems.append("a malformed key was not refused with exit code 2")
+              if os.environ["SW_OUT_CONNECTED"] != "false" or os.environ["SW_OUT_DASHBOARD"] != "":
+                  problems.append("a refused run reports connected mode")
+              if (temp / "spellwarden.json").exists() or (temp / "spellwarden.md").exists():
+                  problems.append("a scan ran although the key was refused")
+          elif not (temp / "spellwarden.json").is_file() or not (temp / "spellwarden.md").is_file():
+              problems.append("the scan wrote no JSON report or no comment file")
+          else:
+              if os.environ["SW_OUT_CONNECTED"] != "true":
+                  problems.append(f"the connected output is {os.environ['SW_OUT_CONNECTED']!r}, expected 'true'")
+              if os.environ["SW_OUT_DASHBOARD"] != "https://dash.spellwarden.ai/acme/repositories/r1":
+                  problems.append(f"the dashboard-url output is {os.environ['SW_OUT_DASHBOARD']!r}")
+              report = json.loads((temp / "spellwarden.json").read_text(encoding="utf-8"))
+              block = report.get("connected") or {}
+              run = block.get("run") or {}
+              if block.get("credential") != ("oidc" if credential == "org" else "key"):
+                  problems.append(f"connected.credential is {block.get('credential')!r}")
+              if event == "pull_request_target":
+                  # a base repository run for the fork's head: it connects and gates as a request (spec 6.8)
+                  head = json.loads((temp / "event.json").read_text(encoding="utf-8"))["pull_request"]["head"]["sha"]
+                  if run.get("kind") != "request" or run.get("head_sha") != head:
+                      problems.append(f"the run is {run.get('kind')!r} with head {run.get('head_sha')!r}, expected a request for {head}")
+                  if (block.get("registry") or {}).get("gate") is not True:
+                      problems.append("the registry gate did not run on the pull_request_target request")
+              elif run.get("kind") != "default_branch":
+                  problems.append(f"the run is {run.get('kind')!r}, expected 'default_branch'")
+              # the comment file the Action's comment step posts: the connected line of the text output (spec 6.10)
+              comment = (temp / "spellwarden.md").read_text(encoding="utf-8")
+              line = re.compile(r"^Connected to Acme as github:github\.com/\S+ \((oidc|key)\): .*$", re.MULTILINE)
+              if not line.search(comment) or "Results: <https://dash.spellwarden.ai/acme/repositories/r1>" not in comment:
+                  problems.append("spellwarden.md has no connected line or no results link")
+          if key:
+              places = [temp / "spellwarden.json", temp / "spellwarden.md", temp / "spellwarden.sarif",
+                        temp / "spellwarden-annotations.txt"]
+              leaked = [str(p.name) for p in places if p.is_file() and key in p.read_text(encoding="utf-8", errors="replace")]
+              leaked += [name for name in ("SW_OUT_EXIT", "SW_OUT_CONNECTED", "SW_OUT_DASHBOARD", "SW_OUT_SARIF") if key in os.environ[name]]
+              leaked += [f"the body of {r['method']} {r['path']}" for r in requests if key in json.dumps(r["body"])]
+              if leaked:
+                  problems.append(f"the key is in {leaked}")
+          for problem in problems:
+              print("FAIL", problem)
+          if not problems:
+              print("connected-case-ok")
+          sys.exit(1 if problems else 0)
+          PY
+      - name: The comment step also runs on pull_request_target
+        if: matrix.event == 'pull_request_target'
+        shell: bash
+        run: grep -q "github.event_name == 'pull_request_target'" action.yml
