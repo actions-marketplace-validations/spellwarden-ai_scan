@@ -79,13 +79,13 @@ The outputs are set even when the job fails before the scan (`2`, `0`, empty, `f
 The lock file `.spellwarden/lock.json` records a hash of every skill, configuration document and plugin source the scanner found. With the lock committed, any change to them shows up as a failed check (exit code `3`) until someone reviews it and updates the lock. Create or update it with:
 
 ```sh
-pipx run spellwarden==1.2.0 lock
+pipx run spellwarden==1.2.1 lock
 ```
 
 The baseline `.spellwarden/baseline.yml` records findings your team accepted, each with a reason, the date it was added and an expiry date (at most 365 days, and 30 days for the rules that indicate malicious intent). Accepted findings stay visible in every report, marked as accepted. To accept every current finding once, when you adopt the Action:
 
 ```sh
-pipx run spellwarden==1.2.0 baseline add --all --reason "Accepted when we adopted Spellwarden" --days 90
+pipx run spellwarden==1.2.1 baseline add --all --reason "Accepted when we adopted Spellwarden" --days 90
 ```
 
 ## Pull requests: settings and baseline from the base commit
@@ -141,7 +141,7 @@ jobs:
       - uses: actions/checkout@<sha>
         with:
           fetch-depth: 0   # recommended, see below
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.0
+      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
         with:
           org: acme
 ```
@@ -153,7 +153,7 @@ jobs:
 For a pipeline that cannot use a CI connection, create a key with access CI under Settings, API keys, store it as a secret and pass it as `api-key` instead of `org`:
 
 ```yaml
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.0
+      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
         with:
           api-key: ${{ secrets.SPELLWARDEN_API_KEY }}
 ```
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/checkout@<sha>
         with:
           fetch-depth: 0
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.0
+      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
         with:
           org: acme
   outside-contribution:
@@ -202,7 +202,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.0
+      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
         with:
           org: acme
 ```
@@ -253,6 +253,7 @@ The Action's version is the scanner's:
 |---|---|
 | `v1.0.0` | runs `spellwarden` 1.0.0 |
 | `v1.2.0` | runs `spellwarden` 1.2.0 and adds connected mode |
+| `v1.2.1` | runs `spellwarden` 1.2.1: connected mode also works on runners without an IPv6 route, such as GitHub-hosted ones |
 
 The JSON report, the lock file, the baseline and the settings file have [published JSON Schemas](https://github.com/spellwarden-ai/spellwarden/tree/main/schemas).
 
