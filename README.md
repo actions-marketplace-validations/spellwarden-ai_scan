@@ -1,6 +1,6 @@
 # Spellwarden Scan
 
-A GitHub Action that checks the agent content in a repository on every pull request: agent skills (`SKILL.md` packages), Claude Code plugin marketplaces and manifests, MCP server configurations (`.mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json`) and Claude Code settings and hook files. It runs the same open-source rules as the hosted Spellwarden product, on your runner. It reports findings as code scanning alerts, in one pull request comment it keeps up to date, and in the job summary. It fails the check at the severity you choose.
+A GitHub Action that checks the agent content in a repository on every pull request: agent skills (`SKILL.md` packages), Claude Code plugin marketplaces and manifests, MCP server configurations (`.mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json`), A2A agent cards (`.well-known/agent-card.json`) and Claude Code settings and hook files. It runs the same open-source rules as the hosted Spellwarden product, on your runner. It reports findings as code scanning alerts, in one pull request comment it keeps up to date, and in the job summary. It fails the check at the severity you choose.
 
 The scanner is [`spellwarden`](https://github.com/spellwarden-ai/spellwarden) (Apache-2.0). The Action installs the exact release named in `requirements.txt`, checking every file against its pinned hash.
 
@@ -79,13 +79,13 @@ The outputs are set even when the job fails before the scan (`2`, `0`, empty, `f
 The lock file `.spellwarden/lock.json` records a hash of every skill, configuration document and plugin source the scanner found. With the lock committed, any change to them shows up as a failed check (exit code `3`) until someone reviews it and updates the lock. Create or update it with:
 
 ```sh
-pipx run spellwarden==1.2.1 lock
+pipx run spellwarden==1.4.0 lock
 ```
 
 The baseline `.spellwarden/baseline.yml` records findings your team accepted, each with a reason, the date it was added and an expiry date (at most 365 days, and 30 days for the rules that indicate malicious intent). Accepted findings stay visible in every report, marked as accepted. To accept every current finding once, when you adopt the Action:
 
 ```sh
-pipx run spellwarden==1.2.1 baseline add --all --reason "Accepted when we adopted Spellwarden" --days 90
+pipx run spellwarden==1.4.0 baseline add --all --reason "Accepted when we adopted Spellwarden" --days 90
 ```
 
 ## Pull requests: settings and baseline from the base commit
@@ -96,11 +96,11 @@ The default `actions/checkout` (depth 1, `persist-credentials: true`) works: the
 
 ## Network access
 
-On the network, the Action contacts the Python package index (PyPI) to install the scanner and dash.spellwarden.ai for the usage ping while telemetry is on, and, in connected mode, your code host's token endpoint and the Spellwarden API at dash.spellwarden.ai (or the proxy you configure). With `probe: true` it also contacts the remote MCP servers of the configuration.
+On the network, the Action contacts the Python package index (PyPI) to install the scanner and dash.spellwarden.ai for the usage ping while telemetry is on, and, in connected mode, your code host's token endpoint and the Spellwarden API at dash.spellwarden.ai (or the proxy you configure). With `probe: true` it also contacts the remote MCP servers of the configuration, the remote A2A agents named in `a2a.agents` and the key sets that signed agent cards name.
 
 ## Usage ping
 
-When the scan runs in CI and telemetry is on, the scanner sends one request per run to `https://dash.spellwarden.ai/api/public/ping`. It holds exactly five fields: the schema number, the scanner version, the rules version, the CI kind (`github`, `gitlab` or `other`) and a hashed installation identity. No file, path, finding or repository name is sent. Runs on a developer's machine send nothing.
+When the scan runs in CI and telemetry is on, the scanner sends one request per run to `https://dash.spellwarden.ai/api/public/ping`. It holds exactly six fields: the schema number, the scanner version, the rules version, the CI kind (`github`, `gitlab` or `other`), a hashed installation identity and one yes-or-no fact, whether the run checked an A2A agent card, from the repository or from an agent you listed. No file, path, finding, card or repository name is sent. Runs on a developer's machine send nothing.
 
 The ping is **pseudonymous, not anonymous**. The identity is the SHA-256 of `spellwarden-ping-v1:github:<host>:<numeric owner id>`. Anyone who knows an owner's id can compute the same hash. One identity stands for one account or organisation on one GitHub host: the same company on GitHub and on GitLab counts twice, and GitHub Enterprise Server is its own identity. Renaming the account does not change it, because the owner id is stable.
 
@@ -113,6 +113,10 @@ To switch it off, set the input `telemetry: false`, or `DO_NOT_TRACK=1` or `SPEL
 With `probe: true`, the scanner sends the unauthenticated MCP handshake to each remote server in the configuration, from the runner, and reports its transport, authentication mode, protocol version and readiness for the 2026-07-28 protocol. It sends no header, token, environment value or argument from your configuration, only the protocol's own requests to the configured URL. It follows the hosted product's rules: HTTPS only, at most 9 requests per server, 50 servers and 300 requests per run, 120 seconds in all.
 
 Private addresses (`10.0.0.0/8` and the like) are refused unless `probe-private: true` is set. Even then it applies only on a push, schedule or manual run (`workflow_dispatch`) of a protected branch or tag: on a pull request, or after a comment or another workflow's run, whoever wrote the change controls the endpoints in it. It then allows only the private addresses of the configured servers themselves, never a link-local address such as the cloud metadata service, and never an address that a server's answer or redirect points to. On a pull request from a fork, probing is switched off altogether.
+
+## A2A agent cards
+
+The Action checks A2A agent cards like any other agent content: every `.well-known/agent-card.json` in the repository, and the cards listed in `a2a.cards` of `.spellwarden/config.yml`. A signed card is verified against the key file named in `a2a.keys`; on a pull request `a2a.keys` and `a2a.agents` come from the base commit. With `probe: true` the scanner also fetches the cards of the remote agents `a2a.agents` lists, and findings on a remote agent's card do not fail a pull request. The full description is the scanner's README, section [Checking A2A agent cards](https://github.com/spellwarden-ai/spellwarden#checking-a2a-agent-cards).
 
 ## Pull requests from forks and Dependabot
 
@@ -141,7 +145,7 @@ jobs:
       - uses: actions/checkout@<sha>
         with:
           fetch-depth: 0   # recommended, see below
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
+      - uses: spellwarden-ai/scan@<sha>  # v1.4.0
         with:
           org: acme
 ```
@@ -153,7 +157,7 @@ jobs:
 For a pipeline that cannot use a CI connection, create a key with access CI under Settings, API keys, store it as a secret and pass it as `api-key` instead of `org`:
 
 ```yaml
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
+      - uses: spellwarden-ai/scan@<sha>  # v1.4.0
         with:
           api-key: ${{ secrets.SPELLWARDEN_API_KEY }}
 ```
@@ -187,7 +191,7 @@ jobs:
       - uses: actions/checkout@<sha>
         with:
           fetch-depth: 0
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
+      - uses: spellwarden-ai/scan@<sha>  # v1.4.0
         with:
           org: acme
   outside-contribution:
@@ -202,7 +206,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - uses: spellwarden-ai/scan@<sha>  # v1.2.1
+      - uses: spellwarden-ai/scan@<sha>  # v1.4.0
         with:
           org: acme
 ```
@@ -231,7 +235,7 @@ A package's identity is a hash over its bytes. A checkout that rewrites line end
 
 ## Supported runners
 
-Linux, macOS and Windows runners with Python 3.11 or newer. GitHub-hosted runners have it. Elsewhere, add `actions/setup-python` before this step. The Action installs the scanner into its own virtual environment and does not change the job's Python.
+Linux, macOS and Windows runners with Python 3.11 or newer. GitHub-hosted runners have it. Elsewhere, add `actions/setup-python` before this step. The Action installs the scanner into its own virtual environment and does not change the job's Python. The scanner verifies the signatures on A2A agent cards with the `cryptography` package, which installs from wheels; the pinned dependencies have wheels for Python 3.11 to 3.14 at the time of this release, so on a newer Python add `actions/setup-python` until a later scanner release.
 
 ## Verifying a release
 
@@ -254,6 +258,8 @@ The Action's version is the scanner's:
 | `v1.0.0` | runs `spellwarden` 1.0.0 |
 | `v1.2.0` | runs `spellwarden` 1.2.0 and adds connected mode |
 | `v1.2.1` | runs `spellwarden` 1.2.1: connected mode also works on runners without an IPv6 route, such as GitHub-hosted ones |
+| `v1.3.0` | runs `spellwarden` 1.3.0: A2A agent cards are checked, signed ones verified, and `probe` also fetches the agents `a2a.agents` lists |
+| `v1.4.0` | runs `spellwarden` 1.4.0: agent cards are read as a protobuf client reads them, so a member spelled with its proto field name (`security_requirements`) is checked, and one spelled both ways is the new rule `SW-A2A-019` (high) |
 
 The JSON report, the lock file, the baseline and the settings file have [published JSON Schemas](https://github.com/spellwarden-ai/spellwarden/tree/main/schemas).
 
